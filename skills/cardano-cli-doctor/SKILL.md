@@ -1,52 +1,107 @@
 ---
 name: cardano-cli-doctor
-description: "Diagnose the local cardano-cli: supported eras, legacy vs era-prefixed syntax, network flags, and produce a compatibility report + recommended command style."
+description: "Diagnose cardano-cli: version, era-prefixed vs legacy syntax, network flags. Produces compatibility report."
+allowed-tools:
+  - Bash(cardano-cli:*)
+  - Bash(which:*)
+  - Read
+context:
+  - "!cardano-cli version 2>&1 | head -10"
+  - "!cardano-cli --help 2>&1 | head -40"
+  - "!cardano-cli conway --help 2>&1 | head -20"
+  - "!cardano-cli latest --help 2>&1 | head -10"
+  - "!cardano-cli transaction build --help 2>&1 | head -30"
 ---
 
 # cardano-cli-doctor
 
 ## When to use
-- Use when you need to figure out which `cardano-cli` command style the user should use (era-prefixed like `cardano-cli conway ...` vs legacy flags like `--babbage-era`).
-- Use before generating complex CLI workflows (script spends, staking, governance) to avoid wrong flags.
+- Before generating CLI workflows to detect correct command style (era-prefixed vs legacy)
+- When debugging CLI flag errors or version mismatches
+- When setting up a new environment
 
 ## Operating rules (must follow)
-- Never ask for or log secret key contents.
-- Prefer **read-only** diagnostics first (`--help`, `version`, `query tip`).
-- If the user is on an air-gapped machine, avoid commands that require network connectivity unless they explicitly want that.
-- Output a **Compat Report** and a **Recommended Style** (with example commands).
+- Never ask for or log secret key contents
+- Prefer **read-only** diagnostics (`--help`, `version`, `query tip`)
+- If air-gapped machine, avoid network commands unless explicitly requested
+- Output a **Compat Report** with recommended command style
 
 ## Workflow
-1) Collect environment facts
-   - OS / shell
-   - `cardano-cli version` output
-   - `cardano-cli --help` output (first ~40 lines is enough)
-   - Check for era-prefixed command availability:
-     - `cardano-cli conway --help`
-     - `cardano-cli latest --help` (if present)
-   - Check for legacy era flags in transaction help:
-     - `cardano-cli transaction build --help` (look for `--babbage-era` / `--alonzo-era` etc)
+1) Collect environment facts (auto-injected via context)
+   - CLI version
+   - Available era-prefixed commands (conway, latest)
+   - Legacy flag presence (--babbage-era, etc.)
 
 2) Decide command style
-   - If `cardano-cli conway --help` works ⇒ **era-prefixed supported**
-   - If `--babbage-era` exists in help ⇒ **legacy era flags supported**
-   - If both exist ⇒ prefer **era-prefixed** (newer) unless user is pinned to legacy scripts
+   - `cardano-cli conway --help` works → **era-prefixed supported**
+   - `--babbage-era` in help → **legacy flags supported**
+   - Both exist → prefer **era-prefixed** (newer)
 
-3) Network sanity checks (optional)
-   - If user provides node socket env / connection, run:
-     - `cardano-cli query tip --mainnet` or `--testnet-magic <N>`
-   - Detect and report common misconfig (missing socket, wrong magic, wrong network)
+3) Network sanity (optional, if socket available)
+   - `cardano-cli query tip --mainnet` or `--testnet-magic <N>`
+   - Detect: missing socket, wrong magic, sync status
 
-4) Produce a Compat Report
-   - CLI version + commit
-   - Supported era prefix commands (conway, babbage, alonzo, shelley, latest)
-   - Legacy flag support detected (yes/no)
-   - Recommended command style (era-prefixed vs legacy)
-   - Network flags to use (`--mainnet` vs `--testnet-magic`)
-   - Next-step templates to copy/paste
+4) Produce Compat Report
+   ```
+   CLI Version: X.Y.Z
+   Era-prefixed: ✓ conway, latest
+   Legacy flags: ✓ --babbage-era
+   Recommended: era-prefixed (cardano-cli conway ...)
+   Network: --testnet-magic 1 (preprod)
+   ```
+
+## Examples
+
+### Example 1: Modern CLI (era-prefixed)
+**Input:** User has cardano-cli 10.1.0
+
+**Output:**
+```
+=== Cardano CLI Compatibility Report ===
+
+CLI Version: 10.1.0.0
+Git Rev: abc123
+
+Supported Commands:
+  ✓ cardano-cli conway --help (recommended)
+  ✓ cardano-cli latest --help
+  ✓ cardano-cli babbage --help
+
+Recommended Style: ERA-PREFIXED
+  cardano-cli conway transaction build ...
+  cardano-cli conway query utxo ...
+
+Network Flags:
+  Mainnet: --mainnet
+  Preprod: --testnet-magic 1
+  Preview: --testnet-magic 2
+```
+
+### Example 2: Legacy CLI
+**Input:** User has cardano-cli 8.x
+
+**Output:**
+```
+=== Cardano CLI Compatibility Report ===
+
+CLI Version: 8.24.0.0
+
+Supported Commands:
+  ✗ Era-prefixed not available
+
+Legacy Flags Detected:
+  ✓ --babbage-era
+  ✓ --alonzo-era
+
+Recommended Style: LEGACY FLAGS
+  cardano-cli transaction build --babbage-era ...
+```
 
 ## Safety / key handling
-- Avoid commands that print or touch `.skey` files.
-- Recommend `chmod 600 *.skey` and offline keygen for real funds.
+- Avoid commands that print or touch `.skey` files
+- Recommend `chmod 600 *.skey` for real funds
+- Prefer offline keygen for mainnet
 
-## References used by this skill
+## References
 - `shared/PRINCIPLES.md` (repo)
+- [Cardano CLI documentation](https://github.com/IntersectMBO/cardano-cli)

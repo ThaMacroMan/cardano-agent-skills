@@ -1,88 +1,221 @@
 ---
 name: hydra-head-troubleshooter
-description: "Hydra Head troubleshooting decision tree: map symptoms/logs (PeerConnected, AckSn, no head observed, stuck peer out-of-sync, scripts tx id, cardano-node readiness) to exact fixes."
+description: "Hydra troubleshooting: decision tree for common issues. Maps symptoms to fixes with verification steps."
+allowed-tools:
+  - Read
+user-invocable: true
+context:
+  - "!hydra-node --version 2>&1 | head -3"
 ---
 
 # hydra-head-troubleshooter
 
 ## When to use
-- Use when Hydra Head **doesn't start**, **no head is observed**, **head doesn't make progress**, or peers are **out of sync**.
-- Use when you see log keywords like `PeerConnected`, `AckSn`, `LogicOutcome`, `SnapshotAlreadySigned`, or when the node can't see the head on-chain.
+- Hydra Head doesn't start or no head observed
+- Head exists but doesn't make progress
+- Peers out of sync or disconnected
+- Log messages: PeerConnected, AckSn, LogicOutcome errors
 
 ## Operating rules (must follow)
-- Always confirm network: `mainnet` / `preprod` / `preview` (and magic if applicable) and hydra-node version.
-- Always ask for (or have the user run) these first:
-  - `hydra-node --help` and `hydra-node run --help`
-  - Last ~200 lines of hydra-node logs (JSON lines) from *each* participant, for the same time window
-  - Peers list (`--peer ...`) and keys list (`--cardano-verification-key`, `--hydra-verification-key`)
-- Never request or print key contents (`*.sk`, `*.skey`). File paths are fine.
-- Output: (1) **Root cause hypothesis** (2) **Fix steps** (copy/paste) (3) **Verification checks**.
+- Confirm network and hydra-node version first
+- Request logs from ALL participants for same time window
+- Never request key contents (file paths OK)
+- Output: (1) Root cause (2) Fix steps (3) Verification
 
-## Decision tree (fast)
+## Quick diagnostic commands
+```bash
+# Check hydra-node version
+hydra-node --version
+
+# Check API health
+curl -s localhost:4001/health
+
+# Check peers
+curl -s localhost:4001/peers
+
+# Check head status
+curl -s localhost:4001/status
+
+# Check metrics (if enabled)
+curl -s localhost:6001/metrics | grep hydra
+```
+
+## Decision tree
+
 ### A) "No head is observed from the chain"
-**Symptoms**
-- Head never appears; node seems alive but no Init/Commit/Open progression.
-- Client can't see head state.
 
-**Most common causes + fixes**
-1) Wrong network / cannot connect to cardano-node
-   - Fix: validate `--network` (or `--mainnet/--testnet-magic`) matches the cardano-node you're connected to.
-   - Fix: if using node socket, ensure cardano-node is fully ready; hydra-node can't connect until cardano-node finishes revalidation and opens connections.
-   - Verify: `cardano-cli query tip ...` works and hydra-node logs show chain sync progress.
+**Symptoms:**
+- Head never appears in logs
+- No Init/Commit/Open progression
+- Client shows no head state
 
-2) Scripts transaction id invalid (`--hydra-scripts-tx-id`)
-   - Fix: use the scripts tx id from the hydra-node release notes for your network (preview/preprod/mainnet).
-   - Verify: hydra-node should verify scripts are available on-chain and stop failing at startup.
+**Check 1: Cardano connection**
+```bash
+# Verify cardano-node is ready
+cardano-cli query tip --testnet-magic 1
+# Should show current slot, not error
 
-3) Cardano signing key mismatch vs Init tx vkey
-   - Fix: ensure `--cardano-signing-key` corresponds to the verification key used in the Init transaction.
-   - Fix: ensure all peers have the correct `--cardano-verification-key` for your node.
-   - Verify: peers can observe and advance head lifecycle after Init.
+# Check socket exists
+ls -la $CARDANO_NODE_SOCKET_PATH
+```
+
+**Fix:** Wait for cardano-node sync, verify socket path and network magic
+
+**Check 2: Scripts tx id**
+```bash
+# Verify you're using correct scripts tx id for network
+# Get from hydra-node release notes
+
+# In hydra-node logs, look for:
+grep -i "script" hydra-node.log | head -20
+```
+
+**Fix:** Use correct `--hydra-scripts-tx-id` for your network
+
+**Check 3: Key mismatch**
+```bash
+# Verify cardano.sk matches what peers have as your vkey
+cardano-cli key verification-key \
+  --signing-key-file cardano.sk \
+  --verification-key-file check.vkey
+
+# Compare check.vkey with what you distributed
+```
+
+**Fix:** Re-exchange verification keys with all peers
+
+---
 
 ### B) "Head does not make progress"
-**Symptoms**
-- Head exists but doesn't move through phases; snapshots not confirmed; commands hang.
 
-**Most common causes + fixes**
-1) Peers not connected (`PeerConnected` missing or inconsistent across nodes)
-   - Fix: verify every node has correct `--peer host:port` for every other node and that ports are reachable.
-   - Verify: each node emits/observes `PeerConnected` consistently; metrics `hydra_head_peers_connected` reflects healthy connectivity.
+**Symptoms:**
+- Head exists but stuck at Init or Commit
+- Snapshots not confirmed
+- Commands hang or timeout
 
-2) Hydra keys mismatch / snapshot acks missing (`AckSn` not received by all parties)
-   - Fix: verify each node's `--hydra-signing-key` belongs to the party and that all nodes have the correct `--hydra-verification-key` for peers.
-   - Fix: check logs for `LogicOutcome` errors around snapshot signing.
-   - Verify: `AckSn` observed and snapshots become confirmed.
+**Check 1: Peer connectivity**
+```bash
+# In logs, look for PeerConnected
+grep "PeerConnected" hydra-node.log
+
+# Check metrics
+curl -s localhost:6001/metrics | grep peers_connected
+```
+
+**Fix:** Verify `--peer host:port` is correct and ports are reachable
+
+**Check 2: Hydra key mismatch**
+```bash
+# Look for AckSn issues
+grep -E "AckSn|LogicOutcome" hydra-node.log
+
+# Verify hydra keys match
+hydra-node verify-keys \
+  --hydra-signing-key hydra.sk \
+  --hydra-verification-key peer-hydra.vk
+```
+
+**Fix:** Re-exchange hydra verification keys
+
+**Check 3: Version mismatch**
+```bash
+# All nodes must run compatible versions
+hydra-node --version
+# Compare across all participants
+```
+
+**Fix:** Align hydra-node versions
+
+---
 
 ### C) "Head stuck: peer out of sync"
-**Symptoms**
-- One node accepts txs while others reject; ledger states diverge.
-- Snapshots stop being signed; submits appear to do nothing.
 
-**Primary cause**
-- Different local ledger views due to config drift (`--ledger-protocol-parameters`), version mismatches, or a peer being offline during tx submission.
+**Symptoms:**
+- One node accepts txs, others reject
+- Snapshots stop being signed
+- Ledger state diverged
 
-**Fix (coordinated)**
-- Use snapshot side-loading to revert peers back to latest confirmed snapshot:
-  1) GET the latest confirmed snapshot from a healthy node: `GET /snapshot`
-  2) POST that snapshot to out-of-sync peers: `POST /snapshot` with the ConfirmedSnapshot body
-- This clears pending txs and aligns ledger state so consensus can resume.
+**Cause:** Different ledger views due to config drift or missed txs
 
-**Verify**
-- After side-load, snapshots resume and all parties sign again.
+**Fix: Snapshot side-loading**
+```bash
+# 1. Get latest snapshot from healthy node
+curl -s http://healthy-node:4001/snapshot > snapshot.json
 
-### D) Mirror nodes / HA weirdness
-**Symptoms**
-- You see `SnapshotAlreadySigned` occasionally.
-- etcd quorum / connectivity flaps when too many mirror nodes go down.
+# 2. Post to out-of-sync node
+curl -X POST http://out-of-sync-node:4001/snapshot \
+  -H "Content-Type: application/json" \
+  -d @snapshot.json
+```
 
-**Reality**
-- `SnapshotAlreadySigned` is transient and harmless when running mirror nodes with the same party keys.
-- Keep mirror count < floor(n/2) so etcd quorum remains responsive.
+**Verify:** Snapshots resume, all parties sign again
 
-## Verification checklist (always do)
-- Confirm all nodes are running the same hydra-node version (or compatible range).
-- Confirm scripts tx id matches the network.
-- Confirm cardano-node readiness and correct network flags.
-- Confirm peer mesh connectivity (PeerConnected everywhere).
-- Confirm snapshots progress (AckSn + no LogicOutcome errors).
-- Capture metrics endpoint if enabled (`--monitoring-port`).
+---
+
+### D) Mirror nodes / HA issues
+
+**Symptoms:**
+- `SnapshotAlreadySigned` in logs
+- etcd quorum issues
+
+**Reality:**
+- `SnapshotAlreadySigned` is transient and harmless with mirrors
+- Keep mirror count < floor(n/2) for quorum stability
+
+**Fix:** Reduce mirror count or accept transient warnings
+
+---
+
+## Log patterns to grep
+
+| Pattern | Meaning |
+|---------|---------|
+| `PeerConnected` | Peer connected successfully |
+| `PeerDisconnected` | Peer lost connection |
+| `AckSn` | Snapshot acknowledgment |
+| `LogicOutcome` | Head logic result (check for errors) |
+| `SnapshotConfirmed` | Snapshot finalized |
+| `HeadIsOpen` | Head successfully opened |
+| `HeadIsClosed` | Head closed, contestation started |
+
+## Verification checklist
+
+After any fix:
+- [ ] All nodes same hydra-node version
+- [ ] Scripts tx id correct for network
+- [ ] cardano-node ready (query tip works)
+- [ ] PeerConnected for all peers
+- [ ] AckSn messages flowing
+- [ ] No LogicOutcome errors
+
+## Examples
+
+### Example: Diagnose stuck head
+**User request:** "My Hydra head won't open—stuck at commit"
+
+**Response:**
+```bash
+# 1. Check all peers connected
+grep "PeerConnected" hydra-node.log | tail -10
+# Should see PeerConnected for each peer
+
+# 2. If missing peers, check network
+nc -zv peer-host 5001
+# Should show "Connection succeeded"
+
+# 3. Check all parties committed
+curl -s localhost:4001/status | jq .
+# Look for parties and their commit status
+
+# 4. Check for key issues
+grep -E "InvalidSignature|WrongParty" hydra-node.log
+
+# Common fix: restart with correct peer addresses
+# Verify --peer host:port matches actual peer locations
+```
+
+## References
+- `hydra-head` (operational guidance)
+- `hydra-head-operator` (execution)
+- `reference/sources.md` (doc provenance)
+- [hydra.family troubleshooting](https://hydra.family/head-protocol/docs/how-to/operating-hydra)

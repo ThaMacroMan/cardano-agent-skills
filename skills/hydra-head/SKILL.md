@@ -1,88 +1,210 @@
 ---
 name: hydra-head
-description: "Hydra Head (hydra.family) best practices: run/operate hydra-node, configure keys/peers, open/close heads, commit/deposit/decommit, and production hardening."
+description: "Hydra Head guidance: setup, keys, peers, lifecycle. Best practices from hydra.family. Use operator skill for execution."
+allowed-tools:
+  - Read
+user-invocable: true
+context:
+  - "!hydra-node --version 2>&1 | head -3"
 ---
 
 # hydra-head
 
+> **This is a guidance skill.** Provides best practices and templates. For execution, use `hydra-head-operator`.
+
 ## When to use
-- Use when you are setting up or operating `hydra-node` and `hydra-tui`, or integrating a dApp/client with Hydra Head.
-- Use when debugging head lifecycle issues: peer connectivity, key mismatches, contestation/deposit periods, chain sync, or config drift.
+- Setting up or operating hydra-node
+- Understanding Hydra Head lifecycle
+- Debugging connectivity or configuration issues
 
 ## Operating rules (must follow)
-- Always identify the target network: `mainnet` vs `preprod` vs `preview` (or devnet).
-- Prefer **hydra.family docs** semantics and terminology; avoid mixing in outdated community lore.
-- Treat Cardano `.sk` / `.skey` and Hydra `.sk` as secrets. Never print key contents.
-- For any command/flag, prefer `hydra-node --help` and `hydra-node run --help` to confirm your installed version.
-- Provide reproducible steps: config file/flags, directory layout, and a “how to verify it worked” check.
+- Confirm network (mainnet/preprod/preview/devnet)
+- Use hydra.family docs as source of truth
+- Never execute—only provide guidance
+- Treat all `.sk` files as secrets
 
-## Core best practices (from hydra.family docs)
-1) Separate key roles
-   - Cardano keys: identify the participant on L1 and pay fees for protocol transactions.
-   - Hydra keys: used to multi-sign snapshots inside the head.
-2) Connectivity requirements
-   - hydra-node must connect to Cardano (via node socket + magic, or via Blockfrost project file).
-   - hydra-node must connect to peers via `--peer host:port` and you should see PeerConnected signals/messages.
-3) Lifecycle correctness
-   - Contestation period (CP) governs the safety window after Close for Contest.
-   - Deposit period (DP) influences when deposits are recognized; ensure deadlines are set safely beyond `now + DP`.
-4) Production posture
-   - Orchestrators should restart hydra-node if Cardano node is still revalidating and sockets aren’t ready.
-   - Keep a strict “compatibility bundle”: scripts tx id for the network, correct signing keys, and peer vkeys.
+## Key concepts
 
-## Workflow
-1) Decide your topology and participants
-   - Basic head: N hydra-nodes connected to each other and to Cardano; local client (hydra-tui) talks to one node.
+### Key roles
+1. **Cardano keys**: Identify participant on L1, pay tx fees
+2. **Hydra keys**: Multi-sign snapshots inside the head
 
-2) Generate keys
-   - Cardano payment keys (`cardano-cli address key-gen`)
-   - Hydra keys (`hydra-node gen-hydra-key --output-file <name>`)
+### Lifecycle
+```
+Init → Commit → Open → [L2 transactions] → Close → Contest → Fanout
+```
 
-3) Configure and run hydra-node
-   - Choose Cardano connection mode:
-     - Direct to cardano-node: `--node-socket ...` plus `--testnet-magic <N>` or `--mainnet`
-     - Blockfrost: `--blockfrost <project-file>` (do NOT also pass `--mainnet/--testnet-magic`)
-   - Set protocol parameters:
-     - `--contestation-period <Xs>`
-     - `--deposit-period <Xs>` (if used in your setup)
-   - Provide identity & peers:
-     - `--cardano-signing-key ...`
-     - `--cardano-verification-key ...` (for each peer)
-     - `--hydra-signing-key ...`
-     - `--hydra-verification-key ...` (for each peer)
-     - `--peer host:port` for each peer
+### Important parameters
+- **Contestation period**: Safety window for contesting after Close
+- **Deposit period**: Window for recognizing deposits
 
-4) Open a head (client-driven)
-   - Use hydra-tui or client API to:
-     - Init
-     - Commit
-     - Open
-   - Verify the head is open by observing status in client/logs.
+## Setup guide
 
-5) Operate inside the head
-   - Submit L2 transactions through the hydra-node API/client.
-   - For adding funds after open: use deposits (if supported/needed).
-   - For taking funds out: decommit workflow (incl. incremental decommits if enabled).
+### 1. Generate keys
+```bash
+# Cardano payment keys
+cardano-cli conway address key-gen \
+  --verification-key-file cardano.vk \
+  --signing-key-file cardano.sk
 
-6) Close and settle safely
-   - Close head
-   - Monitor contestation window; ensure nodes will automatically Contest if needed.
-   - Fanout / finalize on L1.
-   - Verify final UTxO distribution on Cardano.
+# Hydra keys
+hydra-node gen-hydra-key --output-file hydra
+# Creates hydra.sk and hydra.vk
 
-7) Debug checklist (common failure modes)
-   - Wrong network / magic or Blockfrost misconfiguration
-   - cardano-node not ready (socket not open yet)
-   - Wrong scripts transaction id for the network
-   - Signing key mismatch vs Init tx verification key
-   - Peers not connected (bad `--peer` host:port)
-   - Hydra key mismatch (AckSn / snapshot signing issues)
+chmod 600 *.sk
+```
+
+### 2. Exchange keys with peers
+Each participant needs:
+- Their own `cardano.sk` and `hydra.sk`
+- All peers' `cardano.vk` and `hydra.vk`
+
+### 3. Get scripts tx id
+```bash
+# From hydra-node release notes for your network
+# Preview: <scripts-tx-id-preview>
+# Preprod: <scripts-tx-id-preprod>
+# Mainnet: <scripts-tx-id-mainnet>
+```
+
+### 4. Configure hydra-node
+```bash
+hydra-node run \
+  --node-id "alice" \
+  --persistence-dir ./hydra-data \
+  \
+  # Cardano connection (choose one):
+  --node-socket /path/to/node.socket \
+  --testnet-magic 1 \
+  # OR:
+  --blockfrost blockfrost.txt \
+  \
+  # Identity:
+  --cardano-signing-key cardano.sk \
+  --hydra-signing-key hydra.sk \
+  \
+  # Peers (repeat for each):
+  --cardano-verification-key bob-cardano.vk \
+  --hydra-verification-key bob-hydra.vk \
+  --peer "bob.example.com:5001" \
+  \
+  # Protocol:
+  --hydra-scripts-tx-id <scripts-tx-id> \
+  --contestation-period 120s \
+  \
+  # API:
+  --api-host 0.0.0.0 \
+  --api-port 4001 \
+  --host 0.0.0.0 \
+  --port 5001
+```
+
+## Head operations
+
+### Open a head
+```bash
+# Via hydra-tui
+hydra-tui --connect localhost:4001
+
+# Via API
+curl -X POST localhost:4001/init
+# Then each party commits
+curl -X POST localhost:4001/commit \
+  -H "Content-Type: application/json" \
+  -d '{"utxo": {...}}'
+```
+
+### L2 transactions
+```bash
+# Submit transaction
+curl -X POST localhost:4001/submit \
+  -H "Content-Type: application/json" \
+  -d '{"transaction": "..."}'
+```
+
+### Close and fanout
+```bash
+curl -X POST localhost:4001/close
+# Wait for contestation period
+curl -X POST localhost:4001/fanout
+```
+
+## Examples
+
+### Example: 2-party head on preprod
+**User request:** "Set up a 2-party Hydra head on preprod"
+
+**Response:**
+```bash
+# === Party 1 (Alice) ===
+
+# 1. Create directory
+mkdir -p ~/hydra/alice && cd ~/hydra/alice
+
+# 2. Generate keys
+cardano-cli conway address key-gen \
+  --verification-key-file cardano.vk \
+  --signing-key-file cardano.sk
+
+hydra-node gen-hydra-key --output-file hydra
+chmod 600 *.sk
+
+# 3. Get preprod scripts tx id from release notes
+SCRIPTS_TX_ID="..."
+
+# 4. Exchange keys with Bob (get bob-cardano.vk, bob-hydra.vk)
+
+# 5. Run node
+hydra-node run \
+  --node-id "alice" \
+  --persistence-dir ./data \
+  --node-socket $CARDANO_NODE_SOCKET_PATH \
+  --testnet-magic 1 \
+  --cardano-signing-key cardano.sk \
+  --hydra-signing-key hydra.sk \
+  --cardano-verification-key bob-cardano.vk \
+  --hydra-verification-key bob-hydra.vk \
+  --peer "bob-host:5001" \
+  --hydra-scripts-tx-id $SCRIPTS_TX_ID \
+  --contestation-period 120s \
+  --api-port 4001 \
+  --port 5001
+
+# === After both nodes running ===
+
+# 6. Init head (either party)
+curl -X POST localhost:4001/init
+
+# 7. Commit funds
+hydra-tui --connect localhost:4001
+# Select UTxO to commit
+
+# 8. Head opens when all commit
+```
+
+## Verification checklist
+- [ ] All nodes same hydra-node version
+- [ ] Scripts tx id matches network
+- [ ] cardano-node fully synced and socket ready
+- [ ] All peers exchanged correct vkeys
+- [ ] PeerConnected messages in logs
+- [ ] Network ports open between peers
+
+## Common issues
+See `hydra-head-troubleshooter` skill for:
+- "No head observed"
+- "Head doesn't make progress"
+- "Peer out of sync"
+- AckSn/PeerConnected issues
 
 ## Safety / key handling
-- Prefer offline key generation for real funds.
-- Restrict permissions on key files and keep separate directories per participant.
-- Use testnets/devnet for rehearsal before mainnet.
+- Never share `.sk` files
+- Keep separate directories per participant
+- Test on devnet/preprod first
+- Back up persistence directory
 
-## References used by this skill
-- hydra.family Head protocol docs (configuration, getting started, tutorials, operating hydra-node)
-- `shared/PRINCIPLES.md` (repo)
+## References
+- `shared/PRINCIPLES.md`
+- `hydra-head-operator` (for execution)
+- `hydra-head-troubleshooter` (for debugging)
+- See `reference/sources.md` for doc provenance
