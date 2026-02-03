@@ -23,9 +23,9 @@ Send env:
   SEND_LOVELACE           Amount in lovelace (default: 1000000)
 
 Stake env:
-  POOL_ID                 Bech32 pool id (pool1...)
+  POOL_ID                 Pool id: bech32 (pool1...) or hex (56 chars); hex is auto-converted
   REGISTER_STAKE          1 to include stake registration
-  (Staking with CLI keys uses CSL for dual-key signing; requires @emurgo/cardano-serialization-lib-nodejs.)
+  (Staking with CLI keys uses CSL for dual-key signing; requires @emurgo/cardano-serialization-lib-nodejs. Hex POOL_ID requires bech32.)
 
 Confirm env:
   CONFIRM                 1 to poll for tx confirmation
@@ -104,11 +104,9 @@ async function waitForTx(provider, txHash) {
 /**
  * Sign an unsigned stake tx with both payment and stake keys using CSL.
  * MeshWallet.signTx() only signs with the payment key; stake certs require the stake key witness.
+ * We parse the unsigned tx, hash the body, create vkey witnesses for both keys, and rebuild
+ * the Transaction with the same body and auxiliary_data (preserved to avoid MissingTxMetadata).
  * Requires @emurgo/cardano-serialization-lib-nodejs.
- * @param {string} unsignedTxHex - Unsigned transaction CBOR hex
- * @param {string} paymentCborHex - Payment signing key cborHex (5820 + 32-byte key hex)
- * @param {string} stakeCborHex - Stake signing key cborHex (5820 + 32-byte key hex)
- * @returns {string} Signed transaction hex
  */
 async function signStakeTxWithCsl(unsignedTxHex, paymentCborHex, stakeCborHex) {
   const CSL = await import("@emurgo/cardano-serialization-lib-nodejs");
@@ -117,22 +115,67 @@ async function signStakeTxWithCsl(unsignedTxHex, paymentCborHex, stakeCborHex) {
   const stakeBytes = Buffer.from(stakeCborHex.slice(4), "hex");
   if (paymentBytes.length !== 32 || stakeBytes.length !== 32) {
     throw new Error(
-      "Invalid skey cborHex: expected 5820 + 64 hex chars (32 bytes)"
+      "Invalid skey cborHex: expected 5820 + 64 hex chars (32 bytes). Staking needs both PAYMENT_SKEY_CBOR_HEX and STAKE_SKEY_CBOR_HEX."
     );
   }
   const fromBytes =
     CSL.PrivateKey.from_normal_bytes ?? CSL.PrivateKey.fromNormalBytes;
   const paymentPrivKey = fromBytes(new Uint8Array(paymentBytes));
   const stakePrivKey = fromBytes(new Uint8Array(stakeBytes));
-  const FixedTx = CSL.FixedTransaction;
-  const fromHex = FixedTx.from_hex ?? FixedTx.fromHex;
-  const fixedTx = fromHex(unsignedTxHex);
-  const signAdd =
-    fixedTx.sign_and_add_vkey_signature ?? fixedTx.signAndAddVkeySignature;
-  signAdd.call(fixedTx, paymentPrivKey);
-  signAdd.call(fixedTx, stakePrivKey);
-  const toHex = fixedTx.to_hex ?? fixedTx.toHex;
-  return toHex.call(fixedTx);
+
+  // Parse unsigned tx (body + empty witnesses + optional auxiliary_data from Mesh)
+  const parseTx = CSL.Transaction.from_hex ?? CSL.Transaction.fromHex;
+  const unsignedTx = parseTx
+    ? parseTx(unsignedTxHex)
+    : CSL.Transaction.from_bytes(
+        new Uint8Array(Buffer.from(unsignedTxHex, "hex"))
+      );
+  const txBody = unsignedTx.body();
+  const auxiliaryData = unsignedTx.auxiliary_data
+    ? unsignedTx.auxiliary_data()
+    : undefined;
+
+  const hashTx = CSL.hash_transaction ?? CSL.hashTransaction;
+  const txHash = hashTx(txBody);
+
+  const makeWitness = CSL.make_vkey_witness ?? CSL.makeVkeyWitness;
+  const paymentWitness = makeWitness(txHash, paymentPrivKey);
+  const stakeWitness = makeWitness(txHash, stakePrivKey);
+
+  const Vkeywitnesses = CSL.Vkeywitnesses ?? CSL.VkeyWitnesses;
+  const vkeys = Vkeywitnesses.new();
+  vkeys.add(paymentWitness);
+  vkeys.add(stakeWitness);
+
+  const witnessSet = CSL.TransactionWitnessSet.new();
+  witnessSet.set_vkeys
+    ? witnessSet.set_vkeys(vkeys)
+    : witnessSet.setVkeys(vkeys);
+
+  const signedTx = CSL.Transaction.new(txBody, witnessSet, auxiliaryData);
+  return (signedTx.to_hex ?? signedTx.toHex).call(signedTx);
+}
+
+/**
+ * Normalize pool ID: accept hex (56 hex chars) and convert to bech32 (pool1...).
+ * deserializePoolId() expects bech32; many APIs return hex.
+ */
+function normalizePoolId(poolId) {
+  const s = String(poolId).trim();
+  if (/^pool1[a-z0-9]+$/i.test(s)) return s;
+  if (/^[0-9a-fA-F]{56}$/.test(s)) {
+    try {
+      const bech32 = require("bech32");
+      const bytes = Buffer.from(s, "hex");
+      const words = bech32.toWords(bytes);
+      return bech32.encode("pool", words);
+    } catch (err) {
+      throw new Error(
+        "Hex pool ID requires the 'bech32' package. Install: npm install bech32"
+      );
+    }
+  }
+  return s;
 }
 
 /**
@@ -239,7 +282,8 @@ async function main() {
       throw new Error("No reward address available for staking.");
     }
 
-    const poolIdHash = deserializePoolId(poolId);
+    const poolIdBech32 = normalizePoolId(poolId);
+    const poolIdHash = deserializePoolId(poolIdBech32);
 
     let builder = txBuilder;
     if (registerStake) {
@@ -265,9 +309,10 @@ async function main() {
         );
         signedTx = signedTxHex;
       } catch (err) {
+        const msg = err?.message || String(err);
         console.error(
-          "Stake signing with CSL failed. Ensure @emurgo/cardano-serialization-lib-nodejs is installed. Error:",
-          err?.message || err
+          "Stake signing failed (stake certs need both payment and stake key witnesses). Ensure @emurgo/cardano-serialization-lib-nodejs is installed. Error:",
+          msg
         );
         throw err;
       }

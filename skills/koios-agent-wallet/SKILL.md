@@ -254,7 +254,8 @@ KOIOS_NETWORK=api MODE=stake REGISTER_STAKE=1 POOL_ID=pool1... \
 - **Stake address not registered**: Always use `REGISTER_STAKE=1` for the first delegation (or the stake cert will fail). Omit or set to 0 when changing delegation only.
 - **Insufficient funds for deposit**: Stake registration locks ~2 ADA. Ensure wallet has 2 ADA + fees before running Step 3.
 - **Staking requires stake key**: Wallet must be loaded with `STAKE_SKEY_CBOR_HEX` (or root key); payment-only cannot sign stake certs.
-- **Stake cert signing**: `MeshWallet.signTx()` only adds the payment key witness; stake registration/delegation certs require the stake key witness too. The skill’s `agent-wallet.js` uses `@emurgo/cardano-serialization-lib-nodejs` (CSL) `FixedTransaction` to sign with both keys when using CLI keys in stake mode. For staking with CLI keys, install: `@meshsdk/core` and `@emurgo/cardano-serialization-lib-nodejs`.
+- **Stake cert signing**: `MeshWallet.signTx()` only adds the payment key witness; stake registration/delegation certs require the **stake key witness** too. If you see `MissingVKeyWitnessesUTXOW` or `KeyHash {...}`, the missing witness is usually the stake key. The skill’s `agent-wallet.js` uses CSL to hash the tx body, create `make_vkey_witness` for both payment and stake keys, and rebuild `Transaction.new(body, witnessSet, auxiliaryData)` so auxiliary data is preserved (avoids `MissingTxMetadata`). For staking with CLI keys, install: `@meshsdk/core`, `@emurgo/cardano-serialization-lib-nodejs`, and (if using hex pool ID) `bech32`.
+- **Pool ID format**: `deserializePoolId()` expects bech32 (`pool1...`). Many APIs return hex (56 hex chars). The script accepts both: pass `POOL_ID` as bech32 or hex; hex is auto-converted using the `bech32` package.
 - MeshJS staking reference: <https://meshjs.dev/apis/txbuilder/staking#stake-address-not-registered-error>
 
 ### Summary
@@ -280,7 +281,7 @@ KOIOS_NETWORK=api MODE=stake REGISTER_STAKE=1 POOL_ID=pool1... \
 
 ## Scripts
 
-- `scripts/agent-wallet.js` — end-to-end template (wallet init, send ADA, stake, confirm). **Staking with CLI keys:** uses CSL `FixedTransaction` to sign with both payment and stake keys (MeshWallet.signTx only signs with payment key). Requires `@emurgo/cardano-serialization-lib-nodejs` for stake mode with CLI keys.
+- `scripts/agent-wallet.js` — end-to-end template (wallet init, send ADA, stake, confirm). **Staking with CLI keys:** uses CSL to hash tx body, create vkey witnesses for both payment and stake keys, and rebuild the transaction with auxiliary data preserved (MeshWallet.signTx only signs with payment key; stake certs need both). **Pool ID:** accepts bech32 (`pool1...`) or hex (56 chars); hex is converted to bech32 via `bech32`. Deps: `@meshsdk/core`, `@emurgo/cardano-serialization-lib-nodejs`; for hex `POOL_ID`, also `bech32`.
 - `scripts/generate-key-based-wallet.js` — generate new key-based wallet (no mnemonic, no cardano-cli); uses MeshJS + Koios only; creates payment + stake keys and outputs CBOR hex for use with agent-wallet (staking-ready).
 
 ### Generate new wallet (key-based, stakable)
@@ -290,7 +291,7 @@ KOIOS_NETWORK=api MODE=stake REGISTER_STAKE=1 POOL_ID=pool1... \
 node scripts/generate-key-based-wallet.js
 ```
 
-Outputs: base + stake addresses and `PAYMENT_SKEY_CBOR_HEX` / `STAKE_SKEY_CBOR_HEX` export lines. If `WALLET_DIR` is set, writes `addresses.json`, `payment.skey`, `stake.skey`, and (if `@noble/ed25519` is installed) `payment.vkey`, `stake.vkey`. No cardano-cli required. Requires `@meshsdk/core` and Koios (network). For staking with `agent-wallet.js` (CLI keys), also install `@emurgo/cardano-serialization-lib-nodejs`.
+Outputs: base + stake addresses and `PAYMENT_SKEY_CBOR_HEX` / `STAKE_SKEY_CBOR_HEX` export lines. If `WALLET_DIR` is set, writes `addresses.json`, `payment.skey`, `stake.skey`, and (if `@noble/ed25519` is installed) `payment.vkey`, `stake.vkey`. No cardano-cli required. Requires `@meshsdk/core` and Koios (network). For staking with `agent-wallet.js` (CLI keys), also install `@emurgo/cardano-serialization-lib-nodejs`; if you pass a hex `POOL_ID`, install `bech32`.
 
 ### Script usage examples
 
@@ -304,7 +305,7 @@ KOIOS_NETWORK=api MODE=send PAYMENT_SKEY_CBOR_HEX=<...> \\
   RECIPIENT_ADDR=addr1... SEND_LOVELACE=1000000 \\
   node scripts/agent-wallet.js
 
-# Register + delegate
+# Register + delegate (POOL_ID can be pool1... or 56-char hex)
 KOIOS_NETWORK=api MODE=stake PAYMENT_SKEY_CBOR_HEX=<...> \\
   STAKE_SKEY_CBOR_HEX=<...> POOL_ID=pool1... REGISTER_STAKE=1 \\
   node scripts/agent-wallet.js
