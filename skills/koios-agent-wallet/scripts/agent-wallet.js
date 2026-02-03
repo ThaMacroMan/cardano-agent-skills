@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-'use strict';
+"use strict";
 
 const usage = `
 Agent wallet template (MeshJS + Koios)
@@ -25,6 +25,7 @@ Send env:
 Stake env:
   POOL_ID                 Bech32 pool id (pool1...)
   REGISTER_STAKE          1 to include stake registration
+  (Staking with CLI keys uses CSL for dual-key signing; requires @emurgo/cardano-serialization-lib-nodejs.)
 
 Confirm env:
   CONFIRM                 1 to poll for tx confirmation
@@ -35,30 +36,30 @@ Self test:
   SELF_TEST=1             Print usage and exit (no dependencies)
 `;
 
-if (process.env.SELF_TEST === '1') {
+if (process.env.SELF_TEST === "1") {
   console.log(usage.trim());
   process.exit(0);
 }
 
-const mode = process.env.MODE || 'status';
-const network = process.env.KOIOS_NETWORK || 'api';
-const apiKey = process.env.KOIOS_API_KEY || '';
-const networkId = Number(process.env.NETWORK_ID || '1');
+const mode = process.env.MODE || "status";
+const network = process.env.KOIOS_NETWORK || "api";
+const apiKey = process.env.KOIOS_API_KEY || "";
+const networkId = Number(process.env.NETWORK_ID || "1");
 
-const payment = process.env.PAYMENT_SKEY_CBOR_HEX || '';
-const stake = process.env.STAKE_SKEY_CBOR_HEX || '';
-const root = process.env.ROOT_XPRV_BECH32 || '';
-const addressOnly = process.env.ADDRESS_ONLY || '';
+const payment = process.env.PAYMENT_SKEY_CBOR_HEX || "";
+const stake = process.env.STAKE_SKEY_CBOR_HEX || "";
+const root = process.env.ROOT_XPRV_BECH32 || "";
+const addressOnly = process.env.ADDRESS_ONLY || "";
 
-const recipient = process.env.RECIPIENT_ADDR || '';
-const sendAmount = process.env.SEND_LOVELACE || '1000000';
+const recipient = process.env.RECIPIENT_ADDR || "";
+const sendAmount = process.env.SEND_LOVELACE || "1000000";
 
-const poolId = process.env.POOL_ID || '';
-const registerStake = process.env.REGISTER_STAKE === '1';
+const poolId = process.env.POOL_ID || "";
+const registerStake = process.env.REGISTER_STAKE === "1";
 
-const confirm = process.env.CONFIRM === '1';
-const confirmRetries = Number(process.env.CONFIRM_RETRIES || '6');
-const confirmDelayMs = Number(process.env.CONFIRM_DELAY_MS || '10000');
+const confirm = process.env.CONFIRM === "1";
+const confirmRetries = Number(process.env.CONFIRM_RETRIES || "6");
+const confirmDelayMs = Number(process.env.CONFIRM_DELAY_MS || "10000");
 
 function requireEnv(value, name) {
   if (!value) {
@@ -70,15 +71,15 @@ function requireEnv(value, name) {
 
 function buildKeyConfig() {
   if (payment) {
-    return { type: 'cli', payment, stake: stake || undefined };
+    return { type: "cli", payment, stake: stake || undefined };
   }
   if (root) {
-    return { type: 'root', bech32: root };
+    return { type: "root", bech32: root };
   }
   if (addressOnly) {
-    return { type: 'address', address: addressOnly };
+    return { type: "address", address: addressOnly };
   }
-  console.error('No key material provided.');
+  console.error("No key material provided.");
   console.error(usage.trim());
   process.exit(1);
 }
@@ -93,13 +94,75 @@ async function waitForTx(provider, txHash) {
     } catch (err) {
       // Ignore until confirmed
     }
-    await new Promise(resolve => setTimeout(resolve, confirmDelayMs));
+    await new Promise((resolve) => setTimeout(resolve, confirmDelayMs));
   }
-  throw new Error(`Tx not confirmed after ${confirmRetries} attempts: ${txHash}`);
+  throw new Error(
+    `Tx not confirmed after ${confirmRetries} attempts: ${txHash}`
+  );
+}
+
+/**
+ * Sign an unsigned stake tx with both payment and stake keys using CSL.
+ * MeshWallet.signTx() only signs with the payment key; stake certs require the stake key witness.
+ * Requires @emurgo/cardano-serialization-lib-nodejs.
+ * @param {string} unsignedTxHex - Unsigned transaction CBOR hex
+ * @param {string} paymentCborHex - Payment signing key cborHex (5820 + 32-byte key hex)
+ * @param {string} stakeCborHex - Stake signing key cborHex (5820 + 32-byte key hex)
+ * @returns {string} Signed transaction hex
+ */
+async function signStakeTxWithCsl(unsignedTxHex, paymentCborHex, stakeCborHex) {
+  const CSL = await import("@emurgo/cardano-serialization-lib-nodejs");
+  // CLI skey cborHex: "5820" + 64 hex chars (32-byte Ed25519 secret)
+  const paymentBytes = Buffer.from(paymentCborHex.slice(4), "hex");
+  const stakeBytes = Buffer.from(stakeCborHex.slice(4), "hex");
+  if (paymentBytes.length !== 32 || stakeBytes.length !== 32) {
+    throw new Error(
+      "Invalid skey cborHex: expected 5820 + 64 hex chars (32 bytes)"
+    );
+  }
+  const fromBytes =
+    CSL.PrivateKey.from_normal_bytes ?? CSL.PrivateKey.fromNormalBytes;
+  const paymentPrivKey = fromBytes(new Uint8Array(paymentBytes));
+  const stakePrivKey = fromBytes(new Uint8Array(stakeBytes));
+  const FixedTx = CSL.FixedTransaction;
+  const fromHex = FixedTx.from_hex ?? FixedTx.fromHex;
+  const fixedTx = fromHex(unsignedTxHex);
+  const signAdd =
+    fixedTx.sign_and_add_vkey_signature ?? fixedTx.signAndAddVkeySignature;
+  signAdd.call(fixedTx, paymentPrivKey);
+  signAdd.call(fixedTx, stakePrivKey);
+  const toHex = fixedTx.to_hex ?? fixedTx.toHex;
+  return toHex.call(fixedTx);
+}
+
+/**
+ * Get unsigned transaction as hex from MeshTxBuilder.complete() result.
+ * Mesh uses CSL under the hood; the result may be a CSL Transaction or wrapper.
+ */
+function getUnsignedTxHex(unsignedTx) {
+  if (typeof unsignedTx === "string") return unsignedTx;
+  const toHex = (o) =>
+    o &&
+    (typeof o.to_hex === "function"
+      ? o.to_hex()
+      : typeof o.toHex === "function"
+      ? o.toHex()
+      : undefined);
+  const h = unsignedTx && toHex(unsignedTx);
+  if (h) return h;
+  const inner = unsignedTx?.tx ?? unsignedTx?.transaction ?? unsignedTx?.body;
+  if (inner && toHex(inner)) return toHex(inner);
+  if (unsignedTx?.hex && typeof unsignedTx.hex === "string")
+    return unsignedTx.hex;
+  if (unsignedTx?.cbor && typeof unsignedTx.cbor === "string")
+    return unsignedTx.cbor;
+  throw new Error(
+    "Could not get tx hex from Mesh unsigned tx. Staking requires @emurgo/cardano-serialization-lib-nodejs and a Mesh version that exposes tx hex (e.g. .to_hex() on the complete() result)."
+  );
 }
 
 async function main() {
-  const mesh = await import('@meshsdk/core');
+  const mesh = await import("@meshsdk/core");
   const { KoiosProvider, MeshWallet, MeshTxBuilder, deserializePoolId } = mesh;
 
   const provider = new KoiosProvider(network, apiKey || undefined);
@@ -109,13 +172,13 @@ async function main() {
     networkId,
     fetcher: provider,
     submitter: provider,
-    key: keyConfig
+    key: keyConfig,
   });
 
   await wallet.init();
   const changeAddress = await wallet.getChangeAddress();
 
-  if (mode === 'status') {
+  if (mode === "status") {
     const utxos = await provider.fetchAddressUTxOs(changeAddress);
     const rewardAddresses = await wallet.getRewardAddresses();
     const rewardAddress = rewardAddresses[0];
@@ -128,22 +191,22 @@ async function main() {
       changeAddress,
       utxoCount: utxos.length,
       rewardAddress: rewardAddress || null,
-      accountInfo
+      accountInfo,
     });
     return;
   }
 
-  if (mode === 'send') {
-    requireEnv(recipient, 'RECIPIENT_ADDR');
-    if (keyConfig.type === 'address') {
-      throw new Error('Read-only wallet cannot sign transactions.');
+  if (mode === "send") {
+    requireEnv(recipient, "RECIPIENT_ADDR");
+    if (keyConfig.type === "address") {
+      throw new Error("Read-only wallet cannot sign transactions.");
     }
 
     const txBuilder = new MeshTxBuilder({ fetcher: provider });
     const utxos = await wallet.getUtxos();
 
     const unsignedTx = await txBuilder
-      .txOut(recipient, [{ unit: 'lovelace', quantity: sendAmount }])
+      .txOut(recipient, [{ unit: "lovelace", quantity: sendAmount }])
       .changeAddress(changeAddress)
       .selectUtxosFrom(utxos)
       .complete();
@@ -159,13 +222,13 @@ async function main() {
     return;
   }
 
-  if (mode === 'stake') {
-    requireEnv(poolId, 'POOL_ID');
-    if (keyConfig.type !== 'cli' && keyConfig.type !== 'root') {
-      throw new Error('Staking requires a signing wallet (cli or root).');
+  if (mode === "stake") {
+    requireEnv(poolId, "POOL_ID");
+    if (keyConfig.type !== "cli" && keyConfig.type !== "root") {
+      throw new Error("Staking requires a signing wallet (cli or root).");
     }
-    if (keyConfig.type === 'cli' && !stake) {
-      throw new Error('Staking requires STAKE_SKEY_CBOR_HEX.');
+    if (keyConfig.type === "cli" && !stake) {
+      throw new Error("Staking requires STAKE_SKEY_CBOR_HEX.");
     }
 
     const txBuilder = new MeshTxBuilder({ fetcher: provider, verbose: true });
@@ -173,7 +236,7 @@ async function main() {
     const rewardAddresses = await wallet.getRewardAddresses();
     const rewardAddress = rewardAddresses[0];
     if (!rewardAddress) {
-      throw new Error('No reward address available for staking.');
+      throw new Error("No reward address available for staking.");
     }
 
     const poolIdHash = deserializePoolId(poolId);
@@ -189,7 +252,29 @@ async function main() {
       .changeAddress(changeAddress)
       .complete();
 
-    const signedTx = await wallet.signTx(unsignedTx);
+    // MeshWallet.signTx() only signs with payment key; stake certs need stake key witness.
+    // Use CSL FixedTransaction to sign with both keys when using CLI keys.
+    let signedTx;
+    if (keyConfig.type === "cli" && payment && stake) {
+      try {
+        const unsignedTxHex = getUnsignedTxHex(unsignedTx);
+        const signedTxHex = await signStakeTxWithCsl(
+          unsignedTxHex,
+          payment,
+          stake
+        );
+        signedTx = signedTxHex;
+      } catch (err) {
+        console.error(
+          "Stake signing with CSL failed. Ensure @emurgo/cardano-serialization-lib-nodejs is installed. Error:",
+          err?.message || err
+        );
+        throw err;
+      }
+    } else {
+      signedTx = await wallet.signTx(unsignedTx);
+    }
+
     const txHash = await wallet.submitTx(signedTx);
     console.log({ txHash });
 
@@ -205,7 +290,7 @@ async function main() {
   process.exit(1);
 }
 
-main().catch(err => {
+main().catch((err) => {
   console.error(err?.message || err);
   process.exit(1);
 });
