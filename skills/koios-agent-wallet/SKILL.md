@@ -10,18 +10,21 @@ description: "Quick setup of key-based Cardano agent wallets with MeshJS (MeshWa
 - Confirm target network (mainnet, preprod, preview, guild) before giving endpoints if unclear.
 - Use KoiosProvider for read + submit; do not suggest it for key generation.
 - Never request seed phrases or private keys; keep examples with placeholder addresses only.
+- Agent runtime must not use mnemonic phrases for signing/staking; use `cli` keys or `root` key mode only.
 - Use the correct Koios base URL per network and confirm with the user if unsure.
 - Staking requires a stake signing key; if only a payment key is available, staking cannot be signed.
 
 ## Quickstart workflow
 1) Confirm key-based setup and environment
-   - Ask: CLI-generated signing keys, root private key, or mnemonic?
+   - Ask: CLI-generated signing keys or root private key?
+   - If user only has a mnemonic, instruct them to derive/export keys offline first; do not use mnemonic directly in agent runtime.
    - Ask: Node.js or browser? TypeScript or JavaScript?
 
 2) Provide key-based wallet creation path
    - Use MeshWallet for key-based wallets (CLI keys or root key).
    - For staking, require both payment.skey and stake.skey (or a root key).
    - If CLI keys are needed, direct the user to their preferred key generation tooling.
+   - If mnemonic is provided to the agent, fail fast with a clear error and request CLI/root key input.
 
 3) Provide Koios base URL for the network
    - Mainnet: `https://api.koios.rest`
