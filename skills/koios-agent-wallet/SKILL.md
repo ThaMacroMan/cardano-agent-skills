@@ -48,6 +48,7 @@ description: "Quick setup of key-based Cardano agent wallets with MeshJS (MeshWa
    - Send ADA transactions with MeshTxBuilder.
    - Register and delegate stake with MeshTxBuilder + `deserializePoolId`.
    - Confirm staking status with `provider.fetchAccountInfo`.
+   - Sign + submit prebuilt txs from dApp mint builders (e.g., Nexus).
 
 ## MeshJS key-based wallet (MeshWallet)
 
@@ -186,6 +187,29 @@ const txHash = await wallet.submitTx(signedTx);
 console.log(txHash);
 ```
 
+## Mint NFTs via dApp builder (Nexus / similar)
+
+Minting on hosted dApps typically means their backend builds an **unsigned** transaction and your wallet only signs. Koios submits it. You cannot recreate these mint transactions without the policy script + server rules, so the agent should **sign and submit the dApp-built tx**.
+
+### Step 1: Capture the unsigned tx (CBOR hex)
+
+- Use the dApp’s mint API that the website calls after wallet connect.
+- Capture the request/response in browser devtools; look for response fields like `txCbor`, `cborHex`, `unsignedTx`, or `tx`.
+- If the API returns base64, convert to hex before using the script.
+
+### Step 2: Sign + submit (agent)
+
+```bash
+KOIOS_NETWORK=api MODE=sign-submit \
+  PAYMENT_SKEY_CBOR_HEX=<your_payment_skey_cbor_hex> \
+  TX_CBOR_HEX=<unsigned_tx_cbor_hex_from_api> \
+  node scripts/agent-wallet.js
+```
+
+- Optional: `TX_FILE=/path/to/tx.cborhex`, `PRINT_SIGNED=1`, `CONFIRM=1`.
+- The payment key must match the address used in the mint request.
+- `MODE=sign-submit` preserves existing script witnesses/redeemers in the tx.
+
 ## Stake to a pool (register + delegate)
 
 ```typescript
@@ -255,7 +279,8 @@ KOIOS_NETWORK=api MODE=stake REGISTER_STAKE=1 POOL_ID=pool1... \
 - **Insufficient funds for deposit**: Stake registration locks ~2 ADA. Ensure wallet has 2 ADA + fees before running Step 3.
 - **Staking requires stake key**: Wallet must be loaded with `STAKE_SKEY_CBOR_HEX` (or root key); payment-only cannot sign stake certs.
 - **Stake cert signing**: `MeshWallet.signTx()` only adds the payment key witness; stake registration/delegation certs require the **stake key witness** too. If you see `MissingVKeyWitnessesUTXOW` or `KeyHash {...}`, the missing witness is usually the stake key. The skill’s `agent-wallet.js` uses CSL to hash the tx body, create `make_vkey_witness` for both payment and stake keys, and rebuild `Transaction.new(body, witnessSet, auxiliaryData)` so auxiliary data is preserved (avoids `MissingTxMetadata`). For staking with CLI keys, install: `@meshsdk/core`, `@emurgo/cardano-serialization-lib-nodejs`, and (if using hex pool ID) `bech32`.
-- **Pool ID format**: `deserializePoolId()` expects bech32 (`pool1...`). Many APIs return hex (56 hex chars). The script accepts both: pass `POOL_ID` as bech32 or hex; hex is auto-converted using the `bech32` package.
+- **Pool ID (recommended):** The skill uses MeshJS’s `deserializePoolId(pool1...)` with a **bech32** pool ID — that is correct. **Prefer the bech32 pool ID from a trusted source** (e.g. Cardanoscan or the pool’s official page) instead of manually converting hex to bech32; manual conversion with a generic `bech32` library can produce the wrong ID (wrong checksum / wrong pool). When an API gives you a hex pool ID, look up the pool on Cardanoscan and use the `pool1...` ID shown there. The script can accept hex and attempt conversion, but the canonical source is the explorer’s bech32.
+- **Pool ID format:** `deserializePoolId()` expects bech32 (`pool1...`). Pass `POOL_ID` as bech32 when possible; hex (56 chars) is supported and converted via the `bech32` package, but using the bech32 ID from Cardanoscan is more reliable.
 - MeshJS staking reference: <https://meshjs.dev/apis/txbuilder/staking#stake-address-not-registered-error>
 
 ### Summary
@@ -281,7 +306,7 @@ KOIOS_NETWORK=api MODE=stake REGISTER_STAKE=1 POOL_ID=pool1... \
 
 ## Scripts
 
-- `scripts/agent-wallet.js` — end-to-end template (wallet init, send ADA, stake, confirm). **Staking with CLI keys:** uses CSL to hash tx body, create vkey witnesses for both payment and stake keys, and rebuild the transaction with auxiliary data preserved (MeshWallet.signTx only signs with payment key; stake certs need both). **Pool ID:** accepts bech32 (`pool1...`) or hex (56 chars); hex is converted to bech32 via `bech32`. Deps: `@meshsdk/core`, `@emurgo/cardano-serialization-lib-nodejs`; for hex `POOL_ID`, also `bech32`.
+- `scripts/agent-wallet.js` — end-to-end template (wallet init, send ADA, stake, confirm). **Staking with CLI keys:** uses CSL to hash tx body, create vkey witnesses for both payment and stake keys, and rebuild the transaction with auxiliary data preserved (MeshWallet.signTx only signs with payment key; stake certs need both). **Pool ID:** use the **bech32** pool ID (`pool1...`) from Cardanoscan or the pool’s page when possible; the script accepts hex and converts via `bech32`, but manual hex→bech32 conversion can be wrong — prefer the explorer’s `pool1...` ID. Deps: `@meshsdk/core`, `@emurgo/cardano-serialization-lib-nodejs`; for hex `POOL_ID`, also `bech32`.
 - `scripts/generate-key-based-wallet.js` — generate new key-based wallet (no mnemonic, no cardano-cli); uses MeshJS + Koios only; creates payment + stake keys and outputs CBOR hex for use with agent-wallet (staking-ready).
 
 ### Generate new wallet (key-based, stakable)
@@ -305,7 +330,7 @@ KOIOS_NETWORK=api MODE=send PAYMENT_SKEY_CBOR_HEX=<...> \\
   RECIPIENT_ADDR=addr1... SEND_LOVELACE=1000000 \\
   node scripts/agent-wallet.js
 
-# Register + delegate (POOL_ID can be pool1... or 56-char hex)
+# Register + delegate (prefer POOL_ID as pool1... from Cardanoscan)
 KOIOS_NETWORK=api MODE=stake PAYMENT_SKEY_CBOR_HEX=<...> \\
   STAKE_SKEY_CBOR_HEX=<...> POOL_ID=pool1... REGISTER_STAKE=1 \\
   node scripts/agent-wallet.js

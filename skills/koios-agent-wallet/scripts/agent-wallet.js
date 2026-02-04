@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 "use strict";
 
+const fs = require("fs");
+
 const usage = `
 Agent wallet template (MeshJS + Koios)
 
@@ -13,7 +15,7 @@ Alternative key modes:
   ADDRESS_ONLY            Read-only address (no signing)
 
 General env:
-  MODE                    status | send | stake (default: status)
+  MODE                    status | send | stake | sign-submit (default: status)
   KOIOS_NETWORK           api | preprod | preview | guild (default: api)
   KOIOS_API_KEY           Optional Koios API key
   NETWORK_ID              1 (mainnet) or 0 (testnet) (default: 1)
@@ -26,6 +28,11 @@ Stake env:
   POOL_ID                 Pool id: bech32 (pool1...) or hex (56 chars); hex is auto-converted
   REGISTER_STAKE          1 to include stake registration
   (Staking with CLI keys uses CSL for dual-key signing; requires @emurgo/cardano-serialization-lib-nodejs. Hex POOL_ID requires bech32.)
+
+Sign/submit env:
+  TX_CBOR_HEX            Unsigned tx cbor hex (from dApp builder)
+  TX_FILE                Path to file containing unsigned tx cbor hex
+  PRINT_SIGNED           1 to print signed tx cbor hex
 
 Confirm env:
   CONFIRM                 1 to poll for tx confirmation
@@ -57,6 +64,10 @@ const sendAmount = process.env.SEND_LOVELACE || "1000000";
 const poolId = process.env.POOL_ID || "";
 const registerStake = process.env.REGISTER_STAKE === "1";
 
+const txCborHex = process.env.TX_CBOR_HEX || "";
+const txFile = process.env.TX_FILE || "";
+const printSigned = process.env.PRINT_SIGNED === "1";
+
 const confirm = process.env.CONFIRM === "1";
 const confirmRetries = Number(process.env.CONFIRM_RETRIES || "6");
 const confirmDelayMs = Number(process.env.CONFIRM_DELAY_MS || "10000");
@@ -84,6 +95,12 @@ function buildKeyConfig() {
   process.exit(1);
 }
 
+function loadUnsignedTxHex() {
+  if (txCborHex) return String(txCborHex).trim();
+  if (txFile) return fs.readFileSync(txFile, "utf8").trim();
+  return "";
+}
+
 async function waitForTx(provider, txHash) {
   for (let attempt = 1; attempt <= confirmRetries; attempt += 1) {
     try {
@@ -102,28 +119,16 @@ async function waitForTx(provider, txHash) {
 }
 
 /**
- * Sign an unsigned stake tx with both payment and stake keys using CSL.
- * MeshWallet.signTx() only signs with the payment key; stake certs require the stake key witness.
- * We parse the unsigned tx, hash the body, create vkey witnesses for both keys, and rebuild
- * the Transaction with the same body and auxiliary_data (preserved to avoid MissingTxMetadata).
+ * Sign an unsigned tx with one or more CLI keys using CSL.
+ * Preserves existing witness set (scripts, redeemers, datums) and auxiliary data.
  * Requires @emurgo/cardano-serialization-lib-nodejs.
  */
-async function signStakeTxWithCsl(unsignedTxHex, paymentCborHex, stakeCborHex) {
+async function signTxWithCsl(unsignedTxHex, cborHexKeys) {
   const CSL = await import("@emurgo/cardano-serialization-lib-nodejs");
-  // CLI skey cborHex: "5820" + 64 hex chars (32-byte Ed25519 secret)
-  const paymentBytes = Buffer.from(paymentCborHex.slice(4), "hex");
-  const stakeBytes = Buffer.from(stakeCborHex.slice(4), "hex");
-  if (paymentBytes.length !== 32 || stakeBytes.length !== 32) {
-    throw new Error(
-      "Invalid skey cborHex: expected 5820 + 64 hex chars (32 bytes). Staking needs both PAYMENT_SKEY_CBOR_HEX and STAKE_SKEY_CBOR_HEX."
-    );
-  }
   const fromBytes =
     CSL.PrivateKey.from_normal_bytes ?? CSL.PrivateKey.fromNormalBytes;
-  const paymentPrivKey = fromBytes(new Uint8Array(paymentBytes));
-  const stakePrivKey = fromBytes(new Uint8Array(stakeBytes));
 
-  // Parse unsigned tx (body + empty witnesses + optional auxiliary_data from Mesh)
+  // Parse unsigned tx (body + witness set + optional auxiliary_data)
   const parseTx = CSL.Transaction.from_hex ?? CSL.Transaction.fromHex;
   const unsignedTx = parseTx
     ? parseTx(unsignedTxHex)
@@ -133,21 +138,48 @@ async function signStakeTxWithCsl(unsignedTxHex, paymentCborHex, stakeCborHex) {
   const txBody = unsignedTx.body();
   const auxiliaryData = unsignedTx.auxiliary_data
     ? unsignedTx.auxiliary_data()
+    : unsignedTx.auxiliaryData
+    ? unsignedTx.auxiliaryData()
     : undefined;
+
+  const witnessSet = unsignedTx.witness_set
+    ? unsignedTx.witness_set()
+    : unsignedTx.witnessSet
+    ? unsignedTx.witnessSet()
+    : CSL.TransactionWitnessSet.new();
 
   const hashTx = CSL.hash_transaction ?? CSL.hashTransaction;
   const txHash = hashTx(txBody);
 
   const makeWitness = CSL.make_vkey_witness ?? CSL.makeVkeyWitness;
-  const paymentWitness = makeWitness(txHash, paymentPrivKey);
-  const stakeWitness = makeWitness(txHash, stakePrivKey);
-
   const Vkeywitnesses = CSL.Vkeywitnesses ?? CSL.VkeyWitnesses;
   const vkeys = Vkeywitnesses.new();
-  vkeys.add(paymentWitness);
-  vkeys.add(stakeWitness);
 
-  const witnessSet = CSL.TransactionWitnessSet.new();
+  const existingVkeys =
+    typeof witnessSet.vkeys === "function" ? witnessSet.vkeys() : undefined;
+  if (existingVkeys) {
+    for (let i = 0; i < existingVkeys.len(); i += 1) {
+      vkeys.add(existingVkeys.get(i));
+    }
+  }
+
+  const keys = Array.isArray(cborHexKeys) ? cborHexKeys : [cborHexKeys];
+  for (const keyHex of keys) {
+    const hex = String(keyHex || "");
+    if (!hex.startsWith("5820") || hex.length !== 68) {
+      throw new Error(
+        "Invalid skey cborHex: expected 5820 + 64 hex chars (32 bytes)."
+      );
+    }
+    const keyBytes = Buffer.from(hex.slice(4), "hex");
+    if (keyBytes.length !== 32) {
+      throw new Error("Invalid skey cborHex: expected 32-byte key.");
+    }
+    const privKey = fromBytes(new Uint8Array(keyBytes));
+    const witness = makeWitness(txHash, privKey);
+    vkeys.add(witness);
+  }
+
   witnessSet.set_vkeys
     ? witnessSet.set_vkeys(vkeys)
     : witnessSet.setVkeys(vkeys);
@@ -302,11 +334,10 @@ async function main() {
     if (keyConfig.type === "cli" && payment && stake) {
       try {
         const unsignedTxHex = getUnsignedTxHex(unsignedTx);
-        const signedTxHex = await signStakeTxWithCsl(
-          unsignedTxHex,
+        const signedTxHex = await signTxWithCsl(unsignedTxHex, [
           payment,
-          stake
-        );
+          stake,
+        ]);
         signedTx = signedTxHex;
       } catch (err) {
         const msg = err?.message || String(err);
@@ -318,6 +349,43 @@ async function main() {
       }
     } else {
       signedTx = await wallet.signTx(unsignedTx);
+    }
+
+    const txHash = await wallet.submitTx(signedTx);
+    console.log({ txHash });
+
+    if (confirm) {
+      const info = await waitForTx(provider, txHash);
+      console.log({ confirmed: true, info });
+    }
+    return;
+  }
+
+  if (mode === "sign-submit") {
+    if (keyConfig.type === "address") {
+      throw new Error("Read-only wallet cannot sign transactions.");
+    }
+    const unsignedTxHex = loadUnsignedTxHex();
+    requireEnv(unsignedTxHex, "TX_CBOR_HEX or TX_FILE");
+
+    let signedTx;
+    if (keyConfig.type === "cli" && payment) {
+      try {
+        signedTx = await signTxWithCsl(unsignedTxHex, [payment]);
+      } catch (err) {
+        const msg = err?.message || String(err);
+        console.error(
+          "Signing failed (CLI keys require @emurgo/cardano-serialization-lib-nodejs). Error:",
+          msg
+        );
+        throw err;
+      }
+    } else {
+      signedTx = await wallet.signTx(unsignedTxHex);
+    }
+
+    if (printSigned) {
+      console.log({ signedTx });
     }
 
     const txHash = await wallet.submitTx(signedTx);
