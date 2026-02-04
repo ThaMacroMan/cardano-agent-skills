@@ -121,6 +121,7 @@ async function waitForTx(provider, txHash) {
 /**
  * Sign an unsigned tx with one or more CLI keys using CSL.
  * Preserves existing witness set (scripts, redeemers, datums) and auxiliary data.
+ * Uses FixedTransaction for tx hash (CSL 15.x+).
  * Requires @emurgo/cardano-serialization-lib-nodejs.
  */
 async function signTxWithCsl(unsignedTxHex, cborHexKeys) {
@@ -148,8 +149,24 @@ async function signTxWithCsl(unsignedTxHex, cborHexKeys) {
     ? unsignedTx.witnessSet()
     : CSL.TransactionWitnessSet.new();
 
-  const hashTx = CSL.hash_transaction ?? CSL.hashTransaction;
-  const txHash = hashTx(txBody);
+  let txHash;
+  const FixedTransaction = CSL.FixedTransaction;
+  const fixedFromHex = FixedTransaction?.from_hex ?? FixedTransaction?.fromHex;
+  if (fixedFromHex) {
+    const fixedTx = fixedFromHex(unsignedTxHex);
+    const getHash =
+      fixedTx.transaction_hash ?? fixedTx.transactionHash ?? undefined;
+    if (!getHash) {
+      throw new Error("FixedTransaction is missing transaction_hash().");
+    }
+    txHash = getHash.call(fixedTx);
+  } else {
+    const hashTx = CSL.hash_transaction ?? CSL.hashTransaction;
+    if (!hashTx) {
+      throw new Error("CSL missing FixedTransaction and hash_transaction.");
+    }
+    txHash = hashTx(txBody);
+  }
 
   const makeWitness = CSL.make_vkey_witness ?? CSL.makeVkeyWitness;
   const Vkeywitnesses = CSL.Vkeywitnesses ?? CSL.VkeyWitnesses;
@@ -197,7 +214,7 @@ function normalizePoolId(poolId) {
   if (/^pool1[a-z0-9]+$/i.test(s)) return s;
   if (/^[0-9a-fA-F]{56}$/.test(s)) {
     try {
-      const bech32 = require("bech32");
+      const { bech32 } = require("bech32");
       const bytes = Buffer.from(s, "hex");
       const words = bech32.toWords(bytes);
       return bech32.encode("pool", words);
